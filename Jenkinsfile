@@ -2,101 +2,66 @@ pipeline {
     agent any
 
     stages {
-        
-        stage('Checkout OpenBMC') {
+        stage('Launch QEMU with OpenBMC') {
             steps {
-                echo 'Checking out OpenBMC repository...'
-                git 'https://github.com/openbmc/openbmc.git'
-                sh 'ls -la'
+                script {
+                    // Запускаем QEMU в фоне. Это сложный шаг, который может потребовать особой настройки Jenkins-агента.
+                    sh 'nohup qemu-system-arm -m 256 -M romulus-bmc -nographic -drive file=./obmc-image.mtd,format=raw,if=mtd -net nic -net user,hostfwd=:0.0.0.0:2222-:22,hostfwd=:0.0.0.0:2443-:443,hostfwd=udp:0.0.0.0:2623-:623,hostname=qemu > qemu.log 2>&1 &'
+                    // Ждем, пока BMC загрузится
+                    sh 'sleep 60'
+                }
             }
         }
 
-        stage('Environment Check') {
+        stage('Run OpenBMC Autotests') {
             steps {
-                echo 'Checking available tools in Jenkins...'
                 sh '''
-                    echo "=== Environment Info ==="
-                    uname -a
-                    echo "=== Docker ==="
-                    docker --version || echo "Docker not available"
-                    echo "=== QEMU ==="
-                    qemu-system-arm --version || echo "QEMU not available - this is expected"
-                    echo "=== Curl ==="
-                    curl --version || echo "Curl not available"
-                    echo "=== Python ==="
-                    python3 --version || echo "Python3 not available"
+                    echo "=== Running Real BMC Tests ==="
+                    # Предполагается, что obmcutil и ipmitool доступны, а QEMU запущен
+                    sshpass -p '0penBmc' ssh -o StrictHostKeyChecking=no root@localhost -p 2222 'obmcutil state' > bmc_state.log
+                    sshpass -p '0penBmc' ssh -o StrictHostKeyChecking=no root@localhost -p 2222 'obmcutil poweron' > power_control.log
+                    ipmitool -I lanplus -H localhost -p 2623 -U root -P 0penBmc chassis status > ipmi_status.log
+                    curl -k -u root:0penBmc https://localhost:2443/redfish/v1/Systems/system > redfish_system.log
                 '''
+            }
+            post {
+                always {
+                    // Сохраняем логи тестов как артефакты
+                    archiveArtifacts artifacts: '*.log', allowEmptyArchive: true
+                }
             }
         }
 
-        stage('Simulate QEMU Launch') {
+        stage('Run WebUI Tests') {
             steps {
-                echo 'Simulating QEMU with OpenBMC launch...'
-                sh '''
-                    echo "Simulating: qemu-system-arm -m 256 -M romulus-bmc -nographic ..."
-                    echo "In real environment, QEMU would start here"
-                    sleep 10
-                '''
+                // Предполагается, что в репозитории есть скрипт для Selenium/Playwright
+                sh 'python3 run_webui_tests.py'
+            }
+            post {
+                always {
+                    archiveArtifacts artifacts: 'webui_test_report.html, selenium_screenshots/*', allowEmptyArchive: true
+                }
             }
         }
 
-        stage('Run Basic Tests Simulation') {
+        stage('Run Load Testing') {
             steps {
-                echo 'Running simulated tests...'
-                sh '''
-                    echo "=== Simulating OpenBMC Tests ==="
-                    echo "1. BMC State Check: obmcutil state"
-                    echo "2. Power Control: obmcutil poweron/poweroff" 
-                    echo "3. IPMI Test: ipmitool chassis status"
-                    echo "4. Redfish API Test: curl https://localhost:2443/redfish/v1/"
-                    echo "All tests completed successfully (simulation)"
-                '''
+                // Запускаем Locust в режиме одного запуска (без Web UI)
+                sh 'locust -f locustfile.py --headless -u 10 -r 2 --run-time 1m --html=locust_report.html'
             }
-        }
-
-        stage('WebUI Tests Simulation') {
-            steps {
-                echo 'Running WebUI tests simulation...'
-                sh '''
-                    echo "=== Simulating WebUI Tests ==="
-                    echo "1. Login page accessibility"
-                    echo "2. Dashboard loading"
-                    echo "3. Power management interface"
-                    echo "WebUI tests completed (simulation)"
-                '''
-            }
-        }
-
-        stage('Load Testing Simulation') {
-            steps {
-                echo 'Running load testing simulation...'
-                sh '''
-                    echo "=== Simulating Load Tests ==="
-                    echo "Starting stress test for OpenBMC services..."
-                    for i in 1 2 3 4 5; do
-                        echo "Request $i: Simulating API call to BMC"
-                        sleep 1
-                    done
-                    echo "Load testing completed (simulation)"
-                '''
+            post {
+                always {
+                    archiveArtifacts artifacts: 'locust_report.html', allowEmptyArchive: true
+                }
             }
         }
     }
 
     post {
         always {
-            echo '=== Pipeline Execution Report ==='
-            sh '''
-                echo "OpenBMC CI/CD Pipeline - Lab 7"
-                echo "All stages completed successfully (simulated)"
-                echo "Jenkins environment verified"
-            '''
-            archiveArtifacts artifacts: '**/*.md', allowEmptyArchive: true
-        }
-        success {
-            echo '✅ OpenBMC CI/CD Pipeline completed successfully!'
-            sh 'echo "Lab 7: CI/CD for OpenBMC - COMPLETED" > report.txt'
-            archiveArtifacts artifacts: 'report.txt', allowEmptyArchive: true
+            // Останавливаем QEMU в конце пайплайна
+            sh 'pkill -f qemu-system-arm || true'
+            echo 'Pipeline execution finished.'
         }
     }
 }
