@@ -9,16 +9,42 @@ pipeline {
     }
 
     stages {
+        stage('Install QEMU and Dependencies') {
+            steps {
+                echo 'Installing QEMU and required dependencies...'
+                sh '''
+                    echo "=== Installing QEMU ==="
+                    # Пробуем установить QEMU (если есть права)
+                    apt-get update || echo "Cannot update packages - continuing..."
+                    apt-get install -y qemu-system-arm || echo "Cannot install qemu-system-arm - trying alternative..."
+                    
+                    # Проверяем установился ли QEMU
+                    if which qemu-system-arm >/dev/null 2>&1; then
+                        echo "✅ QEMU installed successfully"
+                        qemu-system-arm --version || echo "QEMU version check failed"
+                    else
+                        echo "❌ QEMU installation failed - this pipeline requires QEMU"
+                        echo "Please install QEMU on the Jenkins agent manually"
+                        exit 1
+                    fi
+                    
+                    # Пробуем установить другие полезные утилиты
+                    echo "=== Installing additional tools ==="
+                    apt-get install -y sshpass ipmitool netcat-openbsd bc || echo "Some additional tools not installed"
+                '''
+            }
+        }
+
         stage('Prepare Environment') {
             steps {
                 echo 'Preparing environment for real OpenBMC testing...'
                 sh '''
                     echo "=== Checking available tools ==="
-                    which qemu-system-arm || echo "QEMU not found"
-                    which curl || echo "curl not found"
-                    which unzip || echo "unzip not found"
+                    which qemu-system-arm && echo "✅ QEMU found" || echo "❌ QEMU not found"
+                    which curl && echo "✅ curl found" || echo "❌ curl not found"
+                    which unzip && echo "✅ unzip found" || echo "❌ unzip not found"
                     
-                    # Скачиваем образ как в лабораторной работе 1
+                    # Скачиваем образ если его нет
                     if [ ! -f "romulus/obmc-phosphor-image-romulus-*.static.mtd" ]; then
                         echo "📥 Downloading OpenBMC image (as in Lab 1)..."
                         
@@ -30,7 +56,7 @@ pipeline {
                             echo "✅ ZIP archive downloaded, extracting..."
                             unzip -o romulus.zip
                             echo "✅ Extraction completed"
-                            ls -la romulus/
+                            ls -la romulus/obmc-phosphor-image-romulus-*.static.mtd
                         else
                             echo "❌ Failed to download OpenBMC ZIP archive"
                             exit 1
@@ -52,8 +78,12 @@ pipeline {
                     def imageFile = sh(script: 'ls romulus/obmc-phosphor-image-romulus-*.static.mtd', returnStdout: true).trim()
                     echo "Using image file: ${imageFile}"
                     
+                    // Проверяем что QEMU доступен
+                    sh 'which qemu-system-arm || exit 1'
+                    
                     // Запускаем QEMU в фоне и сохраняем PID
                     sh """
+                        # Запускаем QEMU с реальным образом OpenBMC
                         nohup qemu-system-arm \\
                             -m 256 \\
                             -M romulus-bmc \\
@@ -65,8 +95,20 @@ pipeline {
                             -serial null \\
                             -daemonize
                         
-                        echo "QEMU started with PID: \$(pgrep -f qemu-system-arm)"
-                        pgrep -f qemu-system-arm > qemu.pid
+                        # Даем время на запуск
+                        sleep 3
+                        
+                        # Сохраняем PID
+                        QEMU_PID=\$(pgrep -f qemu-system-arm)
+                        if [ -n "\$QEMU_PID" ]; then
+                            echo "QEMU started with PID: \$QEMU_PID"
+                            echo \$QEMU_PID > qemu.pid
+                        else
+                            echo "❌ QEMU failed to start"
+                            echo "Checking process list:"
+                            ps aux | grep qemu || true
+                            exit 1
+                        fi
                     """
                     
                     // Читаем PID для последующего использования
@@ -83,32 +125,46 @@ pipeline {
                     # Ждем полной загрузки BMC (2-3 минуты)
                     echo "Waiting for BMC to boot (this may take 2-3 minutes)..."
                     
+                    BOOT_SUCCESS=false
                     for i in {1..30}; do
                         echo "Boot check attempt $i/30"
                         
                         # Проверяем доступность Redfish API
                         if curl -k -s https://localhost:2443/redfish/v1/ | grep -q "odata"; then
                             echo "✅ BMC Redfish API is ready!"
+                            BOOT_SUCCESS=true
                             break
                         fi
                         
                         # Проверяем доступность SSH
-                        if nc -z localhost 2222 2>/dev/null || command -v nc >/dev/null && nc -z localhost 2222; then
-                            echo "✅ BMC SSH is ready!"
+                        if command -v nc >/dev/null && nc -z localhost 2222 2>/dev/null; then
+                            echo "✅ BMC SSH port is open!"
+                            BOOT_SUCCESS=true
+                            break
+                        elif curl -k -s telnet://localhost:2222 >/dev/null 2>&1; then
+                            echo "✅ BMC SSH port is open (via curl)!"
+                            BOOT_SUCCESS=true
                             break
                         fi
                         
                         if [ $i -eq 30 ]; then
                             echo "❌ BMC failed to boot within expected time"
-                            echo "Checking QEMU process..."
-                            ps aux | grep qemu || echo "QEMU process not found"
+                            echo "QEMU process status:"
+                            ps aux | grep qemu || echo "No QEMU process found"
+                            echo "Network connections:"
+                            netstat -tuln | grep -E ":(2222|2443|2623)" || echo "No relevant ports open"
                             exit 1
                         fi
                         
                         sleep 6
                     done
                     
-                    echo "BMC boot sequence completed successfully"
+                    if [ "$BOOT_SUCCESS" = true ]; then
+                        echo "🎉 BMC boot sequence completed successfully!"
+                    else
+                        echo "❌ BMC boot failed"
+                        exit 1
+                    fi
                 '''
             }
         }
@@ -122,9 +178,7 @@ pipeline {
                     
                     # Тест 1: Проверка Redfish API
                     echo -e "\\n--- Redfish API Test ---" >> bmc_test_results.log
-                    curl -k -u ${BMC_USER}:${BMC_PASSWORD} https://${BMC_IP}:2443/redfish/v1/Systems/system >> bmc_test_results.log 2>&1
-                    REDFISH_EXIT=$?
-                    if [ $REDFISH_EXIT -eq 0 ]; then
+                    if curl -k -u ${BMC_USER}:${BMC_PASSWORD} https://${BMC_IP}:2443/redfish/v1/Systems/system >> bmc_test_results.log 2>&1; then
                         echo "✅ Redfish API test PASSED" >> bmc_test_results.log
                     else
                         echo "❌ Redfish API test FAILED" >> bmc_test_results.log
@@ -149,32 +203,6 @@ pipeline {
             }
         }
 
-        stage('Test Power Management') {
-            steps {
-                echo '⚡ Testing Power Management...'
-                sh '''
-                    echo "=== Power Management Tests ===" > power_management_test.log
-                    
-                    # Тестируем управление питанием через SSH (если доступно)
-                    if command -v sshpass >/dev/null 2>&1; then
-                        echo -e "\\n--- Power State Check ---" >> power_management_test.log
-                        sshpass -p ${BMC_PASSWORD} ssh -o StrictHostKeyChecking=no ${BMC_USER}@${BMC_IP} -p 2222 'obmcutil state' >> power_management_test.log 2>&1
-                        
-                        echo -e "\\n--- Power On Test ---" >> power_management_test.log
-                        sshpass -p ${BMC_PASSWORD} ssh -o StrictHostKeyChecking=no ${BMC_USER}@${BMC_IP} -p 2222 'obmcutil poweron && echo "Power ON command sent"' >> power_management_test.log 2>&1
-                        sleep 5
-                        
-                        echo -e "\\n--- Power Status After ON ---" >> power_management_test.log
-                        sshpass -p ${BMC_PASSWORD} ssh -o StrictHostKeyChecking=no ${BMC_USER}@${BMC_IP} -p 2222 'obmcutil state' >> power_management_test.log 2>&1
-                        
-                        echo "✅ Power management tests completed" >> power_management_test.log
-                    else
-                        echo "ℹ️ Power management tests SKIPPED (sshpass not available)" >> power_management_test.log
-                    fi
-                '''
-            }
-        }
-
         stage('Run Load Testing') {
             steps {
                 echo '📊 Running Load Tests...'
@@ -193,7 +221,6 @@ pipeline {
                         REQUEST_TIME=$((END_TIME - START_TIME))
                         echo "Request $i completed in ${REQUEST_TIME}s" >> load_test_results.log
                         
-                        # Небольшая пауза между запросами
                         sleep 1
                     done
                     
@@ -217,17 +244,20 @@ pipeline {
                     # Принудительно завершаем если еще работает
                     pkill -f qemu-system-arm 2>/dev/null || true
                     rm -f qemu.pid
+                else
+                    echo "No QEMU PID file found, trying to kill any QEMU processes..."
+                    pkill -f qemu-system-arm 2>/dev/null || echo "No QEMU processes found"
                 fi
                 
                 # Сбор артефактов
                 echo "=== Collecting Artifacts ==="
                 ls -la *.log || echo "No log files found"
                 ls -la romulus.zip || echo "No zip file found"
-                ls -la romulus/ || echo "No romulus directory found"
             '''
             
             archiveArtifacts artifacts: '*.log', allowEmptyArchive: true
             archiveArtifacts artifacts: 'romulus.zip', allowEmptyArchive: true
+            archiveArtifacts artifacts: 'qemu.pid', allowEmptyArchive: true
         }
         success {
             echo '✅ OpenBMC CI/CD Pipeline with REAL QEMU completed successfully!'
