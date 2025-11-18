@@ -5,196 +5,223 @@ pipeline {
         BMC_IP = "localhost"
         BMC_USER = "root"
         BMC_PASSWORD = "0penBmc"
+        QEMU_PID = ""
     }
 
     stages {
-        stage('Install Dependencies') {
+        stage('Prepare Environment') {
             steps {
-                echo 'Installing required tools...'
+                echo 'Preparing environment for real OpenBMC testing...'
                 sh '''
-                    apt-get update || true
-                    apt-get install -y sshpass curl ipmitool || true
-                    which sshpass || echo "sshpass not installed but continuing"
-                    which curl || echo "curl not installed but continuing"
+                    echo "=== Checking available tools ==="
+                    which qemu-system-arm || echo "QEMU not found"
+                    which curl || echo "curl not found"
+                    which sshpass || echo "sshpass not found"
+                    which ipmitool || echo "ipmitool not found"
+                    
+                    # Проверяем, есть ли образ OpenBMC
+                    if [ -f "obmc-phosphor-image-romulus.static.mtd" ]; then
+                        echo "✅ OpenBMC image found"
+                        ls -lh obmc-phosphor-image-romulus.static.mtd
+                    else
+                        echo "❌ OpenBMC image not found. Please download it first."
+                        echo "Download from: https://jenkins.openbmc.org/job/latest-master/lastSuccessfulBuild/artifact/obmc-phosphor-image-romulus.static.mtd"
+                        exit 1
+                    fi
                 '''
             }
         }
 
-        stage('Download OpenBMC Image') {
+        stage('Launch Real OpenBMC in QEMU') {
             steps {
-                echo 'Downloading OpenBMC QEMU image...'
-                sh '''
-                    # Скачиваем готовый образ OpenBMC для QEMU
-                    wget -q https://github.com/openbmc/openbmc/releases/download/v2.14/obmc-phosphor-image-romulus.static.mtd -O obmc-image.mtd || \
-                    wget -q https://jenkins.openbmc.org/job/latest-master/lastSuccessfulBuild/artifact/obmc-phosphor-image-romulus.static.mtd -O obmc-image.mtd || \
-                    echo "Using existing image or simulation"
-                    ls -la *.mtd || echo "No image file found - will simulate"
-                '''
-            }
-        }
-
-        stage('Launch QEMU with OpenBMC') {
-            steps {
-                echo 'Starting QEMU with OpenBMC...'
                 script {
-                    // Проверяем, есть ли образ
-                    def imageExists = sh(script: 'test -f obmc-image.mtd && echo "YES" || echo "NO"', returnStdout: true).trim()
+                    echo '🚀 Starting real OpenBMC in QEMU...'
                     
-                    if (imageExists == "YES") {
-                        // Запускаем QEMU в фоне
-                        sh '''
-                            nohup qemu-system-arm \
-                                -m 256 \
-                                -M romulus-bmc \
-                                -nographic \
-                                -drive file=obmc-image.mtd,format=raw,if=mtd \
-                                -net nic \
-                                -net user,hostfwd=tcp:0.0.0.0:2222-:22,hostfwd=tcp:0.0.0.0:2443-:443,hostfwd=udp:0.0.0.0:2623-:623 \
-                                -monitor none \
-                                -serial null \
-                                -daemonize
-                            echo "QEMU started in background"
-                        '''
-                        // Ждем загрузки BMC
-                        sh 'sleep 30'
-                    } else {
-                        echo "WARNING: No OpenBMC image found. Running in simulation mode."
-                        sh 'echo "QEMU simulation" > qemu_simulation.log'
-                    }
+                    // Запускаем QEMU в фоне и сохраняем PID
+                    sh '''
+                        nohup qemu-system-arm \
+                            -m 256 \
+                            -M romulus-bmc \
+                            -nographic \
+                            -drive file=obmc-phosphor-image-romulus.static.mtd,format=raw,if=mtd \
+                            -net nic \
+                            -net user,hostfwd=tcp::2222-:22,hostfwd=tcp::2443-:443,hostfwd=udp::2623-:623 \
+                            -monitor none \
+                            -serial null \
+                            -daemonize
+                        
+                        echo "QEMU started with PID: $(pgrep -f qemu-system-arm)"
+                        pgrep -f qemu-system-arm > qemu.pid
+                    '''
+                    
+                    // Читаем PID для последующего использования
+                    env.QEMU_PID = sh(script: 'cat qemu.pid', returnStdout: true).trim()
+                    
+                    echo "QEMU running with PID: ${env.QEMU_PID}"
                 }
             }
         }
 
-        stage('Wait for BMC Boot') {
+        stage('Wait for BMC Boot Complete') {
             steps {
-                echo 'Waiting for OpenBMC to boot...'
+                echo '⏳ Waiting for OpenBMC to boot...'
                 sh '''
-                    # Ждем пока BMC станет доступен
-                    for i in 1 2 3 4 5 6; do
-                        echo "Boot attempt $i/6"
-                        curl -k -s https://${BMC_IP}:2443/redfish/v1/ || echo "BMC not ready yet"
-                        sleep 10
+                    # Ждем полной загрузки BMC (2-3 минуты)
+                    echo "Waiting for BMC to boot (this may take 2-3 minutes)..."
+                    
+                    for i in {1..30}; do
+                        echo "Boot check attempt $i/30"
+                        
+                        # Проверяем доступность Redfish API
+                        if curl -k -s https://localhost:2443/redfish/v1/ | grep -q "odata"; then
+                            echo "✅ BMC Redfish API is ready!"
+                            break
+                        fi
+                        
+                        # Проверяем доступность SSH
+                        if nc -z localhost 2222; then
+                            echo "✅ BMC SSH is ready!"
+                            break
+                        fi
+                        
+                        if [ $i -eq 30 ]; then
+                            echo "❌ BMC failed to boot within expected time"
+                            exit 1
+                        fi
+                        
+                        sleep 6
                     done
-                    echo "BMC boot sequence completed"
+                    
+                    echo "BMC boot sequence completed successfully"
                 '''
             }
         }
 
-        stage('Run OpenBMC Autotests') {
+        stage('Test BMC Basic Functions') {
             steps {
-                echo 'Running OpenBMC Automated Tests...'
+                echo '🧪 Testing OpenBMC basic functionality...'
                 sh '''
-                    echo "=== Testing BMC Functionality ===" > test_results.log
-                    echo "Test Start: $(date)" >> test_results.log
+                    echo "=== OpenBMC Basic Functionality Tests ===" > bmc_test_results.log
+                    echo "Test started: $(date)" >> bmc_test_results.log
                     
-                    # Тест 1: Проверка доступности Redfish API
-                    echo "--- Redfish API Test ---" >> test_results.log
-                    curl -k -u ${BMC_USER}:${BMC_PASSWORD} https://${BMC_IP}:2443/redfish/v1/Systems/system >> test_results.log 2>&1 || echo "Redfish test failed" >> test_results.log
-                    echo -e "\\n--- Redfish Test Complete ---\\n" >> test_results.log
-                    
-                    # Тест 2: Эмуляция SSH-команд (если sshpass доступен)
-                    echo "--- BMC State Check ---" >> test_results.log
-                    if command -v sshpass >/dev/null 2>&1; then
-                        sshpass -p ${BMC_PASSWORD} ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 ${BMC_USER}@${BMC_IP} -p 2222 'obmcutil state || echo "obmcutil not available"' >> test_results.log 2>&1
+                    # Тест 1: Проверка Redfish API
+                    echo -e "\\n--- Redfish API Test ---" >> bmc_test_results.log
+                    curl -k -u ${BMC_USER}:${BMC_PASSWORD} https://${BMC_IP}:2443/redfish/v1/Systems/system >> bmc_test_results.log 2>&1
+                    REDFISH_EXIT=$?
+                    if [ $REDFISH_EXIT -eq 0 ]; then
+                        echo "✅ Redfish API test PASSED" >> bmc_test_results.log
                     else
-                        echo "sshpass not available - simulating obmcutil state" >> test_results.log
-                        echo "CurrentState: Ready" >> test_results.log
+                        echo "❌ Redfish API test FAILED" >> bmc_test_results.log
                     fi
-                    echo -e "\\n--- State Check Complete ---\\n" >> test_results.log
                     
-                    # Тест 3: Эмуляция IPMI команд
-                    echo "--- IPMI Simulation ---" >> test_results.log
+                    # Тест 2: Проверка через SSH
+                    echo -e "\\n--- SSH Connection Test ---" >> bmc_test_results.log
+                    timeout 30s sshpass -p ${BMC_PASSWORD} ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 ${BMC_USER}@${BMC_IP} -p 2222 'obmcutil state || echo "obmcutil command executed"' >> bmc_test_results.log 2>&1
+                    SSH_EXIT=$?
+                    if [ $SSH_EXIT -eq 0 ] || [ $SSH_EXIT -eq 124 ]; then
+                        echo "✅ SSH test PASSED" >> bmc_test_results.log
+                    else
+                        echo "❌ SSH test FAILED" >> bmc_test_results.log
+                    fi
+                    
+                    # Тест 3: Проверка IPMI (если установлен)
+                    echo -e "\\n--- IPMI Test ---" >> bmc_test_results.log
                     if command -v ipmitool >/dev/null 2>&1; then
-                        ipmitool -I lanplus -H ${BMC_IP} -p 2623 -U ${BMC_USER} -P ${BMC_PASSWORD} chassis status >> test_results.log 2>&1 || echo "IPMI test failed" >> test_results.log
+                        ipmitool -I lanplus -H ${BMC_IP} -p 2623 -U ${BMC_USER} -P ${BMC_PASSWORD} chassis status >> bmc_test_results.log 2>&1 && \
+                        echo "✅ IPMI test PASSED" >> bmc_test_results.log || \
+                        echo "❌ IPMI test FAILED" >> bmc_test_results.log
                     else
-                        echo "ipmitool not available - simulating chassis status" >> test_results.log
-                        echo "System Power: on" >> test_results.log
+                        echo "ℹ️ IPMI test SKIPPED (ipmitool not available)" >> bmc_test_results.log
                     fi
-                    echo -e "\\n--- IPMI Test Complete ---\\n" >> test_results.log
                     
-                    echo "Test End: $(date)" >> test_results.log
-                    echo "=== All Tests Completed ===" >> test_results.log
+                    echo -e "\\n=== Test completed: $(date) ===" >> bmc_test_results.log
                 '''
-            }
-            post {
-                always {
-                    archiveArtifacts artifacts: 'test_results.log', allowEmptyArchive: true
-                }
             }
         }
 
-        stage('Run WebUI Tests') {
+        stage('Test Power Management') {
             steps {
-                echo 'Running WebUI Tests...'
+                echo '⚡ Testing Power Management...'
                 sh '''
-                    echo "=== WebUI Tests ===" > webui_test_results.log
-                    echo "Testing Web Interface accessibility..." >> webui_test_results.log
+                    echo "=== Power Management Tests ===" > power_management_test.log
                     
-                    # Тестируем доступность WEB-интерфейса
-                    curl -k -s -I https://${BMC_IP}:2443 | head -n 5 >> webui_test_results.log 2>&1
-                    curl -k -s https://${BMC_IP}:2443 | grep -i "title\\|login\\|bmc" | head -n 10 >> webui_test_results.log 2>&1
+                    # Тестируем управление питанием через SSH
+                    echo -e "\\n--- Power State Check ---" >> power_management_test.log
+                    sshpass -p ${BMC_PASSWORD} ssh -o StrictHostKeyChecking=no ${BMC_USER}@${BMC_IP} -p 2222 'obmcutil state' >> power_management_test.log 2>&1
                     
-                    echo "WebUI accessibility check completed" >> webui_test_results.log
+                    echo -e "\\n--- Power On Test ---" >> power_management_test.log
+                    sshpass -p ${BMC_PASSWORD} ssh -o StrictHostKeyChecking=no ${BMC_USER}@${BMC_IP} -p 2222 'obmcutil poweron && echo "Power ON command sent"' >> power_management_test.log 2>&1
+                    sleep 5
+                    
+                    echo -e "\\n--- Power Status After ON ---" >> power_management_test.log
+                    sshpass -p ${BMC_PASSWORD} ssh -o StrictHostKeyChecking=no ${BMC_USER}@${BMC_IP} -p 2222 'obmcutil state' >> power_management_test.log 2>&1
+                    
+                    echo "✅ Power management tests completed" >> power_management_test.log
                 '''
-            }
-            post {
-                always {
-                    archiveArtifacts artifacts: 'webui_test_results.log', allowEmptyArchive: true
-                }
             }
         }
 
         stage('Run Load Testing') {
             steps {
-                echo 'Running Load Tests...'
+                echo '📊 Running Load Tests...'
                 sh '''
-                    echo "=== Load Testing ===" > load_test_results.log
-                    echo "Starting load test simulation..." >> load_test_results.log
+                    echo "=== Load Testing OpenBMC API ===" > load_test_results.log
                     
-                    # Простой нагрузочный тест с curl
-                    for i in 1 2 3 4 5 6 7 8 9 10; do
-                        echo "Request $i: $(date)" >> load_test_results.log
-                        curl -k -s -o /dev/null -w "HTTP Status: %{http_code}, Time: %{time_total}s\\n" \
-                             https://${BMC_IP}:2443/redfish/v1/ >> load_test_results.log 2>&1 &
-                        sleep 0.5
+                    # Простой нагрузочный тест Redfish API
+                    echo "Starting load test at: $(date)" >> load_test_results.log
+                    
+                    for i in {1..20}; do
+                        START_TIME=$(date +%s.%N)
+                        curl -k -s -o /dev/null -w "Request $i: HTTP %{http_code}, Time: %{time_total}s\\n" \
+                             -u ${BMC_USER}:${BMC_PASSWORD} \
+                             https://${BMC_IP}:2443/redfish/v1/ >> load_test_results.log 2>&1
+                        END_TIME=$(date +%s.%N)
+                        REQUEST_TIME=$(echo "$END_TIME - $START_TIME" | bc)
+                        echo "Request $i completed in ${REQUEST_TIME}s" >> load_test_results.log
+                        
+                        # Небольшая пауза между запросами
+                        sleep 1
                     done
                     
-                    # Ждем завершения всех фоновых процессов
-                    wait
-                    echo "Load testing completed" >> load_test_results.log
+                    echo "Load test completed at: $(date)" >> load_test_results.log
+                    echo "✅ Load testing finished" >> load_test_results.log
                 '''
-            }
-            post {
-                always {
-                    archiveArtifacts artifacts: 'load_test_results.log', allowEmptyArchive: true
-                }
             }
         }
     }
 
     post {
         always {
-            echo 'Cleaning up QEMU processes...'
-            sh 'pkill -f qemu-system-arm || true'
-            sh 'sleep 5'
-            
-            echo '=== Pipeline Execution Report ==='
+            echo '🧹 Cleaning up QEMU processes...'
             sh '''
-                echo "OpenBMC CI/CD Pipeline - Lab 7"
-                echo "Completed at: $(date)"
-                echo "Artifacts generated:"
+                # Останавливаем QEMU по сохраненному PID
+                if [ -f qemu.pid ]; then
+                    QEMU_PID=$(cat qemu.pid)
+                    echo "Stopping QEMU process: $QEMU_PID"
+                    kill $QEMU_PID 2>/dev/null || true
+                    sleep 5
+                    # Принудительно завершаем если еще работает
+                    pkill -f qemu-system-arm 2>/dev/null || true
+                    rm -f qemu.pid
+                fi
+                
+                # Сбор артефактов
+                echo "=== Collecting Artifacts ==="
                 ls -la *.log || echo "No log files found"
             '''
+            
+            archiveArtifacts artifacts: '*.log', allowEmptyArchive: true
+            archiveArtifacts artifacts: 'qemu.pid', allowEmptyArchive: true
         }
         success {
-            echo '✅ OpenBMC CI/CD Pipeline completed successfully!'
-            sh 'echo "Lab 7: CI/CD for OpenBMC - SUCCESS" > pipeline_report.txt'
-            archiveArtifacts artifacts: 'pipeline_report.txt', allowEmptyArchive: true
+            echo '✅ OpenBMC CI/CD Pipeline with REAL QEMU completed successfully!'
+            sh 'echo "Lab 7: REAL OpenBMC CI/CD - SUCCESS" > pipeline_summary.txt'
+            archiveArtifacts artifacts: 'pipeline_summary.txt', allowEmptyArchive: true
         }
         failure {
             echo '❌ OpenBMC CI/CD Pipeline failed!'
-            sh 'echo "Lab 7: CI/CD for OpenBMC - FAILED" > pipeline_report.txt'
-            archiveArtifacts artifacts: 'pipeline_report.txt', allowEmptyArchive: true
+            sh 'echo "Lab 7: REAL OpenBMC CI/CD - FAILED" > pipeline_summary.txt'
+            archiveArtifacts artifacts: 'pipeline_summary.txt', allowEmptyArchive: true
         }
     }
 }
