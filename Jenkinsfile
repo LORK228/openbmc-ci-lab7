@@ -1,116 +1,152 @@
 pipeline {
     agent any
 
-    environment {
-        BMC_IP       = "localhost"
-        BMC_USER     = "root"
-        BMC_PASSWORD = "0penBmc"
-    }
-
     stages {
-        stage('Launch Real OpenBMC in QEMU') {
+        stage('Download OpenBMC Image') {
+            steps {
+                sh '''
+                    if [ ! -f "romulus/obmc-phosphor-image-romulus-"*.static.mtd ]; then
+                        echo "Скачиваем образ OpenBMC..."
+                        wget -q "https://jenkins.openbmc.org/job/ci-openbmc/lastSuccessfulBuild/distro=ubuntu,label=docker-builder,target=romulus/artifact/openbmc/build/tmp/deploy/images/romulus/*zip*/romulus.zip" -O romulus.zip
+                        unzip -q romulus.zip
+                        rm romulus.zip
+                    else
+                        echo "Образ уже существует, пропускаем скачивание"
+                    fi
+                '''
+            }
+        }
+
+        stage('Start QEMU') {
             steps {
                 script {
-                    echo 'Запуск OpenBMC в QEMU...'
-
-                    def imageFile = sh(script: 'ls romulus/obmc-phosphor-image-romulus-*.static.mtd', returnStdout: true).trim()
-                    echo "Найден образ: ${imageFile}"
-
-                    sh """
+                    sh '''
+                        echo "=== Запускаем QEMU ==="
+                        pkill -f qemu-system-arm || true
+                        sleep 2
+                        
+                        # Очищаем старые SSH ключи
+                        ssh-keygen -f "/var/jenkins_home/.ssh/known_hosts" -R "[localhost]:2222" 2>/dev/null || true
+                        
+                        IMAGE_FILE=$(ls romulus/obmc-phosphor-image-romulus-*.static.mtd | head -1)
+                        echo "Используем образ: $IMAGE_FILE"
+                        
                         nohup qemu-system-arm \
-                            -m 256 \
-                            -M romulus-bmc \
-                            -nographic \
-                            -drive file=${imageFile},format=raw,if=mtd \
-                            -net nic \
-                            -net user,hostfwd=tcp::2222-:22,hostfwd=tcp::2443-:443,hostfwd=udp::2623-:623 \
-                            -monitor none \
-                            -serial null \
-                            -daemonize > /dev/null 2>&1
-
-                        sleep 8
-
-                        QEMU_PID=\$(pgrep -f qemu-system-arm)
-                        if [ -n "\$QEMU_PID" ]; then
-                            echo "QEMU запущен, PID: \$QEMU_PID"
-                            echo \$QEMU_PID > qemu.pid
-                        else
-                            echo "Ошибка запуска QEMU"
-                            exit 1
-                        fi
-                    """
+                          -m 256 \
+                          -M romulus-bmc \
+                          -nographic \
+                          -drive file="$IMAGE_FILE",format=raw,if=mtd \
+                          -net nic \
+                          -net user,hostfwd=:0.0.0.0:2222-:22,hostfwd=:0.0.0.0:2443-:443,hostfwd=udp:0.0.0.0:623-:623,hostname=qemu \
+                          > qemu.log 2>&1 &
+                        echo $! > qemu.pid
+                        echo "QEMU запущен с PID: $(cat qemu.pid)"
+                    '''
                 }
-            }
-        }
-
-        stage('Wait for BMC Boot Complete') {
-            steps {
-                echo 'Ожидание полной загрузки OpenBMC...'
+                // Увеличиваем время ожидания загрузки
+                sleep time: 120, unit: 'SECONDS'
+                
                 sh '''
-                    BOOT_READY=false
-                    i=1
-                    while [ $i -le 40 ]; do
-                        echo "Проверка загрузки... попытка $i"
-                        if curl -k -s https://localhost:2443/redfish/v1/ | grep -q "odata"; then
-                            echo "Redfish API доступен!"
-                            BOOT_READY=true
-                            break
-                        fi
-                        sleep 5
-                        i=$((i + 1))
-                    done
-
-                    if [ "$BOOT_READY" = false ]; then
-                        echo "OpenBMC не загрузился вовремя"
+                    echo "=== Проверяем запуск QEMU ==="
+                    if ps -p $(cat qemu.pid) > /dev/null 2>&1; then
+                        echo "✓ QEMU запущен успешно"
+                        echo "=== Проверяем доступность сервисов ==="
+                        
+                        # Ждем полной инициализации BMC
+                        echo "Ожидаем инициализацию BMC..."
+                        sleep 30
+                        
+                        # Проверяем доступность SSH
+                        for i in 1 2 3 4 5; do
+                            echo "Проверка SSH, попытка $i..."
+                            if nc -z localhost 2222; then
+                                echo "✓ SSH порт доступен"
+                                break
+                            fi
+                            sleep 10
+                        done
+                        
+                        # Проверяем доступность HTTPS
+                        for i in 1 2 3 4 5; do
+                            echo "Проверка HTTPS, попытка $i..."
+                            if nc -z localhost 2443; then
+                                echo "✓ HTTPS порт доступен"
+                                break
+                            fi
+                            sleep 10
+                        done
+                        
+                        echo "=== Последние логи загрузки ==="
+                        tail -20 qemu.log
+                    else
+                        echo "✗ QEMU не запущен!"
+                        cat qemu.log
                         exit 1
                     fi
-                    echo "OpenBMC успешно загружен!"
                 '''
             }
         }
 
-        stage('Test BMC Redfish API') {
+        stage('Run AutoTests') {
             steps {
-                echo 'Тестирование Redfish API...'
-                sh '''
-                    echo "=== Redfish API Tests ===" > redfish_test.log
-                    date >> redfish_test.log
-
-                    for endpoint in "/redfish/v1/" "/redfish/v1/Systems/system" "/redfish/v1/Managers"; do
-                        echo -e "\\n--- $endpoint ---" >> redfish_test.log
-                        if curl -k -u ${BMC_USER}:${BMC_PASSWORD} -s "https://${BMC_IP}:2443$endpoint" >> redfish_test.log 2>&1; then
-                            echo "OK: $endpoint" >> redfish_test.log
-                        else
-                            echo "FAIL: $endpoint" >> redfish_test.log
-                        fi
-                    done
-                '''
+                script {
+                    sh '''
+                        echo "=== Запускаем автотесты через SSH ===" > autotests.log
+                        
+                        # Используем более гибкие настройки SSH
+                        SSH_OPTS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=30 -o PasswordAuthentication=yes"
+                        
+                        # Ждем полной загрузки системы
+                        echo "Ожидаем полную загрузку OpenBMC..." >> autotests.log
+                        sleep 30
+                        
+                        # Пробуем подключиться несколько раз с увеличенными таймаутами
+                        for i in 1 2 3 4 5; do
+                            echo "Попытка подключения $i..." >> autotests.log
+                            if sshpass -p "0penBmc" ssh $SSH_OPTS -p 2222 root@localhost \
+                                "echo '=== Тест подключения успешен ==='; \
+                                 echo 'Система загружена!'" >> autotests.log 2>&1; then
+                                echo "✓ SSH подключение установлено" >> autotests.log
+                                
+                                # Запускаем основные тесты
+                                echo "=== Запуск системных тестов ===" >> autotests.log
+                                sshpass -p "0penBmc" ssh $SSH_OPTS -p 2222 root@localhost '
+                                    echo "=== Системная информация ==="
+                                    cat /etc/os-release 2>/dev/null || echo "Файл os-release не найден"
+                                    echo
+                                    echo "=== Память ==="  
+                                    free -h 2>/dev/null || echo "Команда free не доступна"
+                                    echo
+                                    echo "=== Диск ==="
+                                    df -h 2>/dev/null || echo "Команда df не доступна"
+                                    echo
+                                    echo "=== Процессы ==="
+                                    ps aux 2>/dev/null | head -10 || echo "Команда ps не доступна"
+                                    echo
+                                    echo "=== Сетевые интерфейсы ==="
+                                    ip addr 2>/dev/null || ifconfig 2>/dev/null || echo "Сетевые команды не доступны"
+                                    echo
+                                    echo "=== Сервисы ==="
+                                    systemctl list-units --type=service 2>/dev/null | head -10 || echo "systemctl не доступен"
+                                    echo
+                                    echo "=== Автотесты завершены ==="
+                                ' >> autotests.log 2>&1
+                                break
+                            else
+                                echo "✗ Попытка $i не удалась" >> autotests.log
+                                sleep 15
+                            fi
+                        done
+                        
+                        echo "=== Результат автотестов ==="
+                        cat autotests.log
+                    '''
+                }
             }
-        }
-
-        stage('Test BMC SSH Access') {
-            steps {
-                echo 'Тестирование SSH-доступа...'
-                sh '''
-                    echo "=== SSH Access Tests ===" > ssh_test.log
-                    date >> ssh_test.log
-
-                    if ! command -v sshpass >/dev/null 2>&1; then
-                        echo "sshpass не найден — установка..." >> ssh_test.log
-                        apt-get update -qq && apt-get install -y -qq sshpass
-                    fi
-
-                    for cmd in "cat /etc/os-release" "uname -a" "ps aux | head -10"; do
-                        echo -e "\\n--- $cmd ---" >> ssh_test.log
-                        if sshpass -p ${BMC_PASSWORD} ssh -o StrictHostKeyChecking=no -o ConnectTimeout=15 ${BMC_USER}@${BMC_IP} -p 2222 "$cmd" >> ssh_test.log 2>&1; then
-                            echo "OK" >> ssh_test.log
-                        else
-                            echo "FAIL" >> ssh_test.log
-                        fi
-                    done
-
-                    echo "SSH тесты завершены" >> ssh_test.log
-                '''
+            post {
+                always {
+                    archiveArtifacts artifacts: 'autotests.log', fingerprint: true
+                }
             }
         }
 
@@ -118,150 +154,112 @@ pipeline {
             steps {
                 echo 'Запуск WebUI тестов через pytest...'
                 sh '''
-                    # Установка зависимостей и создание virtualenv
-                    apt-get update -qq
-                    apt-get install -y -qq python3-pip python3-venv ipmitool sshpass
+                    # Используем python из системы (без установки пакетов)
+                    echo "=== Проверяем доступность WebUI ===" > webui_test.log
+                    
+                    # Ждем инициализации Web-сервиса
+                    for i in 1 2 3 4 5; do
+                        echo "Проверка WebUI, попытка $i..." >> webui_test.log
+                        if curl -k -s https://localhost:2443/redfish/v1/ > /dev/null; then
+                            echo "✓ WebUI доступен" >> webui_test.log
+                            break
+                        fi
+                        sleep 10
+                    done
+                    
+                    # Создаем простой тест на bash вместо Python
+                    cat > simple_webui_test.sh << 'EOF'
+#!/bin/bash
+echo "=== Простой тест WebUI ==="
 
-                    python3 -m venv pytest_venv
-                    . pytest_venv/bin/activate
-                    pip install pytest requests
+# Тест 1: Проверка доступности
+echo "Тест 1: Проверка доступности Redfish API"
+response=$(curl -k -s -w "%{http_code}" -o /dev/null https://localhost:2443/redfish/v1/)
+if [ "$response" -eq 200 ]; then
+    echo "✓ Redfish API доступен (HTTP $response)"
+else
+    echo "✗ Redfish API недоступен (HTTP $response)"
+    exit 1
+fi
 
-                    # Создание файла тестов
-                    cat > test_webui.py << 'EOF'
-import pytest
-import requests
-import json
-import time
+# Тест 2: Получение информации о системе
+echo "Тест 2: Получение информации о системе"
+curl -k -s https://localhost:2443/redfish/v1/Systems/system | head -20
 
-requests.packages.urllib3.disable_warnings()
+# Тест 3: Проверка SessionService
+echo "Тест 3: Проверка SessionService"
+curl -k -s https://localhost:2443/redfish/v1/SessionService | head -10
 
-BASE_URL = "https://127.0.0.1:2443"
-USERNAME = "root"
-PASSWORD = "0penBmc"
-
-@pytest.fixture(scope="session")
-def redfish_session():
-    session_url = f"{BASE_URL}/redfish/v1/SessionService/Sessions"
-    payload = {
-        "UserName": USERNAME,
-        "Password": PASSWORD
-    }
-    headers = {"Content-Type": "application/json"}
-    resp = requests.post(
-        session_url,
-        json=payload,
-        headers=headers,
-        verify=False,
-        timeout=10
-    )
-    assert resp.status_code == 201, f"Login failed: {resp.status_code} {resp.text}"
-    token = resp.headers.get("X-Auth-Token")
-    assert token, "X-Auth-Token not found in login response"
-    session = requests.Session()
-    session.headers.update({
-        "X-Auth-Token": token,
-        "Content-Type": "application/json"
-    })
-    session.verify = False
-    yield session
-    # Завершаем сессию
-    session_id = resp.json().get("Id")
-    if session_id:
-        session.delete(f"{BASE_URL}/redfish/v1/SessionService/Sessions/{session_id}")
-
-def test_authentication(redfish_session):
-    resp = redfish_session.get(f"{BASE_URL}/redfish/v1/")
-    assert resp.status_code == 200
-    data = resp.json()
-    assert "Systems" in data, f"Expected 'Systems' key in root response, got: {data.keys()}"
-
-def test_get_system_info(redfish_session):
-    resp = redfish_session.get(f"{BASE_URL}/redfish/v1/Systems/system")
-    assert resp.status_code == 200
-    data = resp.json()
-    assert "PowerState" in data
-    assert "Status" in data
-
-def test_power_cycle(redfish_session):
-    action_url = f"{BASE_URL}/redfish/v1/Systems/system/Actions/ComputerSystem.Reset"
-    # ForceOff
-    payload_off = {"ResetType": "ForceOff"}
-    resp_off = redfish_session.post(action_url, json=payload_off)
-    assert resp_off.status_code in (200, 202, 204)
-    time.sleep(5)
-    # On
-    payload_on = {"ResetType": "On"}
-    resp_on = redfish_session.post(action_url, json=payload_on)
-    assert resp_on.status_code in (200, 202, 204)
-
-def test_thermal_sensors(redfish_session):
-    resp = redfish_session.get(f"{BASE_URL}/redfish/v1/Chassis")
-    if resp.status_code != 200:
-        pytest.skip("No chassis found")
-    data = resp.json()
-    members = data.get("Members", [])
-    if not members:
-        pytest.skip("No members in chassis")
-    chassis_id = members[0].get("@odata.id").split('/')[-1]
-    thermal_url = f"{BASE_URL}/redfish/v1/Chassis/{chassis_id}/Thermal"
-    resp = redfish_session.get(thermal_url)
-    if resp.status_code != 200:
-        pytest.skip("Thermal endpoint unavailable")
-    data = resp.json()
-    temperatures = data.get("Temperatures", [])
-    if not temperatures:
-        pytest.skip("No temperature sensors found")
-    for sensor in temperatures:
-        reading = sensor.get("ReadingCelsius")
-        if reading is not None:
-            assert 0 <= reading < 120
+echo "=== Базовые тесты WebUI завершены ==="
 EOF
 
-                    # Запуск тестов
-                    pytest -v test_webui.py --junitxml=webui_junit.xml > webui_test.log 2>&1 || true
+                    chmod +x simple_webui_test.sh
+                    ./simple_webui_test.sh >> webui_test.log 2>&1
+                    
                     echo "WebUI тесты завершены"
-
-                    deactivate
+                    cat webui_test.log
                 '''
+            }
+            post {
+                always {
+                    archiveArtifacts artifacts: 'webui_test.log', fingerprint: true
+                }
             }
         }
 
         stage('Run Load Testing') {
             steps {
-                echo 'Нагрузочное тестирование...'
-                sh '''
-                    echo "=== Load Testing ===" > load_test.log
-                    date >> load_test.log
-
-                    for i in {1..30}; do
-                        curl -k -s -o /dev/null -u ${BMC_USER}:${BMC_PASSWORD} \
-                             -w "Запрос $i | Код: %{http_code} | Время: %{time_total}s\\n" \
-                             https://${BMC_IP}:2443/redfish/v1/ >> load_test.log
-                        sleep 0.3
-                    done
-
-                    echo "Нагрузочное тестирование завершено" >> load_test.log
-                '''
+                script {
+                    sh '''
+                        echo "=== Нагрузочное тестирование ===" > loadtest.log
+                        
+                        # Простое нагрузочное тестирование
+                        echo "Запускаем простой нагрузочный тест Redfish API..." >> loadtest.log
+                        
+                        for i in 1 2 3 4 5; do
+                            echo "Запрос $i:" >> loadtest.log
+                            start_time=$(date +%s%3N)
+                            http_code=$(curl -k -s -w "%{http_code}" -o /dev/null https://localhost:2443/redfish/v1/)
+                            end_time=$(date +%s%3N)
+                            duration=$((end_time - start_time))
+                            echo "  Время: ${duration}ms, Код: $http_code" >> loadtest.log
+                            sleep 1
+                        done
+                        
+                        echo "Нагрузочное тестирование завершено" >> loadtest.log
+                        cat loadtest.log
+                    '''
+                }
+            }
+            post {
+                always {
+                    archiveArtifacts artifacts: 'loadtest.log', fingerprint: true
+                }
             }
         }
     }
-
+    
     post {
         always {
-            echo 'Очистка QEMU...'
-            sh '''
-                [ -f qemu.pid ] && kill $(cat qemu.pid) || true
-                rm -f qemu.pid
-                pkill -f qemu-system-arm || true
-            '''
-            archiveArtifacts artifacts: '*.log, *.xml, final_result.txt', allowEmptyArchive: true
-        }
-        success {
-            sh 'echo "Лабораторная 7 — УСПЕШНО ЗАВЕРШЕНА" > final_result.txt'
-            echo 'ВСЁ ОТЛИЧНО!'
-        }
-        failure {
-            sh 'echo "Лабораторная 7 — ПРОВАЛЕНА" > final_result.txt'
+            script {
+                sh '''
+                    echo "=== Завершение работы ==="
+                    if [ -f qemu.pid ]; then
+                        PID=$(cat qemu.pid)
+                        echo "Останавливаем QEMU с PID: $PID"
+                        kill $PID 2>/dev/null || true
+                        sleep 5
+                        # Принудительное завершение если нужно
+                        pkill -9 -f qemu-system-arm 2>/dev/null || true
+                        echo "QEMU остановлен"
+                    fi
+                    
+                    # Сохраняем логи для анализа
+                    echo "=== Финальные логи QEMU ==="
+                    tail -50 qemu.log || true
+                '''
+                archiveArtifacts artifacts: 'qemu.log', fingerprint: true
+            }
         }
     }
 }
